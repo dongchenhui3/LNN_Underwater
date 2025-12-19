@@ -107,5 +107,41 @@ def visualize_gan_results():
     plt.savefig(f"{OUTPUT_DIR}/gan_inputs_outputs.png")
     print(f"Saved correlation plot to {OUTPUT_DIR}/gan_inputs_outputs.png")
 
+    # 3. Visualization: Frequency Domain (FFT)
+    fig3, axes3 = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+    
+    # Calculate FFT
+    from scipy.fft import fft, fftfreq
+    
+    N = length
+    T = 0.005 # 200Hz
+    xf = fftfreq(N, T)[:N//2]
+    
+    labels_xyz = ['X', 'Y', 'Z']
+    
+    for i in range(3):
+        # Apply high pass first to remove DC offset (Earth field)
+        real_noise = high_pass(mag_real[:, i])
+        fake_noise = high_pass(mag_fake[:, i])
+        
+        yf_real = fft(real_noise)
+        yf_fake = fft(fake_noise)
+        
+        # Plot Power Spectrum
+        axes3[i].plot(xf, 2.0/N * np.abs(yf_real[0:N//2]), label='Real Spectrum', color='black', alpha=0.7)
+        axes3[i].plot(xf, 2.0/N * np.abs(yf_fake[0:N//2]), label='Synthetic Spectrum', color='red', alpha=0.7, linestyle='--')
+        
+        axes3[i].set_ylabel(f"Amplitude ({labels_xyz[i]})")
+        axes3[i].set_title(f"Frequency Spectrum: Mag {labels_xyz[i]}", fontsize=10)
+        axes3[i].legend()
+        axes3[i].grid(True)
+        axes3[i].set_xlim(0, 50) # Focus on 0-50Hz
+        
+    axes3[2].set_xlabel("Frequency (Hz)")
+    plt.suptitle("Frequency Domain Analysis (FFT)\nChecking if GAN captures the noise frequency characteristics", fontsize=14)
+    plt.tight_layout()
+    plt.savefig(f"{OUTPUT_DIR}/gan_fft_comparison.png")
+    print(f"Saved FFT plot to {OUTPUT_DIR}/gan_fft_comparison.png")
+
 if __name__ == "__main__":
     visualize_gan_results()

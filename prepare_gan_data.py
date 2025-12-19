@@ -3,6 +3,37 @@ import numpy as np
 import os
 from scipy.spatial.transform import Rotation as R
 
+# [新增] 简化的磁力计校准函数 (基于最小二乘法的椭球拟合)
+def ellipsoidal_calibration(mag_data):
+    # mag_data: (N, 3)
+    # 这是一个简化的代数解法，用于估算 Hard Iron (bias)
+    # 对于更精细的 Soft Iron (W_matrix)，建议使用专门的库如 Magpylib 或单独的校准脚本
+    # 这里为了代码简洁，演示 Hard Iron 移除 + 标度归一化
+    
+    # 1. 构建矩阵 A x = b
+    x, y, z = mag_data[:,0], mag_data[:,1], mag_data[:,2]
+    # D = np.array([x**2, y**2, z**2, 2*y*z, 2*x*z, 2*x*y, 2*x, 2*y, 2*z, np.ones_like(x)]).T
+    # ... (SVD解法较为复杂，这里提供一个工程常用的"最大最小值中心法"作为替代，
+    #      如果您的数据覆盖了足够的旋转空间，这就足够了)
+    
+    min_xyz = np.min(mag_data, axis=0)
+    max_xyz = np.max(mag_data, axis=0)
+    
+    b_hard = (max_xyz + min_xyz) / 2
+    scale_xyz = (max_xyz - min_xyz) / 2
+    avg_scale = np.mean(scale_xyz)
+    
+    # 简单的 Soft Iron 修正矩阵 (仅对角线缩放)
+    W_soft = np.diag(avg_scale / scale_xyz)
+    
+    return b_hard, W_soft
+
+# [新增] 逆校准函数 (用于生成数据时还原)
+def inverse_calibration(mag_clean, b_hard, W_soft):
+    # m_raw = (W^-1 * m_clean) + b
+    W_inv = np.linalg.inv(W_soft)
+    return (mag_clean @ W_inv.T) + b_hard
+
 def prepare_gan_data(data_path, output_path):
     print(f"Loading data from {data_path}...")
     with open(data_path, 'rb') as f:
@@ -19,60 +50,71 @@ def prepare_gan_data(data_path, output_path):
     all_cond = []
     
     # 1. Estimate Global Magnetic Field (B_world_mean)
+    # [修改] 1. 计算全局统一的 Hard/Soft Iron 参数
+    # 将所有序列的磁力计数据拼起来做一次全局校准
+    all_mag_raw = []
+    for x in X_list:
+        all_mag_raw.append(x[:, 6:9])
+    all_mag_raw = np.concatenate(all_mag_raw, axis=0)
+    
+    print("Performing Hard/Soft Iron Calibration on full dataset...")
+    b_hard, W_soft = ellipsoidal_calibration(all_mag_raw)
+    print(f"Hard Iron Bias: {b_hard}")
+    print(f"Soft Iron Scale: {np.diag(W_soft)}")
+
+    # [修改] 2. 计算全局 B_earth_local (校准后的世界系均值)
     avg_mag_world = np.zeros(3)
     total_samples = 0
     
-    print("Estimating local magnetic field (B_ideal)...")
     for i in range(len(X_list)):
         X_seq = X_list[i]
         quat_gt = Y_quat_list[i]
+        mag_raw = X_seq[:, 6:9]
         
-        mag = X_seq[:, 6:9]
+        # 截断长度对齐
+        min_len = min(len(mag_raw), len(quat_gt))
+        mag_raw = mag_raw[:min_len]
+        quat_gt = quat_gt[:min_len]
         
-        # Ensure quat matches length (it should)
-        if len(mag) != len(quat_gt):
-            min_len = min(len(mag), len(quat_gt))
-            mag = mag[:min_len]
-            quat_gt = quat_gt[:min_len]
-            
-        # Create Rotation object
+        # A. 应用校准：得到"去除船体干扰"的磁场
+        # m_cal = W * (m_raw - b)
+        mag_cal = (mag_raw - b_hard) @ W_soft.T
+        
+        # B. 转到世界系
         r = R.from_quat(quat_gt)
-        
-        # Rotate Mag to World Frame: B_world = R_WB * B_body
-        mag_world = r.apply(mag)
+        mag_world = r.apply(mag_cal)
         
         avg_mag_world += np.sum(mag_world, axis=0)
-        total_samples += len(mag)
+        total_samples += min_len
         
     B_ideal = avg_mag_world / total_samples
-    print(f"Estimated B_ideal (World Frame): {B_ideal}")
-    print(f"Magnitude: {np.linalg.norm(B_ideal)}")
+    print(f"Global Earth Field (Clean): {B_ideal}")
     
-    # 2. Compute Residual Noise (train data for GAN)
-    print("Computing residual noise...")
+    # 3. Compute Residual Noise (train data for GAN)
+    print("Computing pure environmental residuals...")
     for i in range(len(X_list)):
         X_seq = X_list[i]
         quat_gt = Y_quat_list[i]
         
         acc = X_seq[:, 0:3]
         gyro = X_seq[:, 3:6]
-        mag = X_seq[:, 6:9]
+        mag_raw = X_seq[:, 6:9]
         
-        if len(mag) != len(quat_gt):
-            min_len = min(len(mag), len(quat_gt))
+        if len(mag_raw) != len(quat_gt):
+            min_len = min(len(mag_raw), len(quat_gt))
             acc = acc[:min_len]
             gyro = gyro[:min_len]
-            mag = mag[:min_len]
+            mag_raw = mag_raw[:min_len]
             quat_gt = quat_gt[:min_len]
         
-        r = R.from_quat(quat_gt)
+        # 校准
+        mag_cal = (mag_raw - b_hard) @ W_soft.T
         
-        # Project Ideal World Field back to Body Frame
-        # B_body_ideal = R_WB^T * B_ideal
+        # 计算纯净残差： n_real = m_cal - R.T * B_ideal
+        r = R.from_quat(quat_gt)
         B_body_ideal = r.inv().apply(B_ideal)
         
-        # Noise = Raw - Ideal
-        noise = mag - B_body_ideal
+        noise = mag_cal - B_body_ideal # 这里的noise现在是纯粹的环境动态噪声
         
         # Condition = [Acc, Gyro]
         cond = np.concatenate([acc, gyro], axis=1)
@@ -97,6 +139,7 @@ def prepare_gan_data(data_path, output_path):
         'noise': X_noise,
         'condition': X_cond,
         'B_ideal': B_ideal,
+        'calibration': {'b_hard': b_hard, 'W_soft': W_soft}, # [新增] 保存校准参数
         'stats': {
             'noise_mean': noise_mean, 'noise_std': noise_std,
             'cond_mean': cond_mean, 'cond_std': cond_std
@@ -160,25 +203,39 @@ if __name__ == "__main__":
     all_cond = []
     
     # 2. Estimate Global Magnetic Field (B_ideal) using ALL data
+    # [新增] 全局 Hard/Soft Iron 校准
+    print("Performing Hard/Soft Iron Calibration on ALL sequences...")
+    all_mag_raw = []
+    for x in X_total:
+        all_mag_raw.append(x[:, 6:9])
+    all_mag_raw = np.concatenate(all_mag_raw, axis=0)
+    
+    b_hard, W_soft = ellipsoidal_calibration(all_mag_raw)
+    print(f"Hard Iron Bias: {b_hard}")
+    print(f"Soft Iron Scale: {np.diag(W_soft)}")
+    
     avg_mag_world = np.zeros(3)
     total_samples_mag = 0
     
     print("Estimating local magnetic field (B_ideal) from all sequences...")
     for i in range(len(X_total)):
-        mag = X_total[i][:, 6:9]
+        mag_raw = X_total[i][:, 6:9]
         quat_gt = Y_quat_total[i]
         
-        limit = min(len(mag), len(quat_gt))
-        mag = mag[:limit]
+        limit = min(len(mag_raw), len(quat_gt))
+        mag_raw = mag_raw[:limit]
         quat_gt = quat_gt[:limit]
         
+        # 校准
+        mag_cal = (mag_raw - b_hard) @ W_soft.T
+        
         r = R.from_quat(quat_gt)
-        mag_world = r.apply(mag)
+        mag_world = r.apply(mag_cal)
         avg_mag_world += np.sum(mag_world, axis=0)
         total_samples_mag += limit
         
     B_ideal = avg_mag_world / total_samples_mag
-    print(f"Estimated B_ideal (All 7 Seqs): {B_ideal}")
+    print(f"Estimated B_ideal (All 7 Seqs, Clean): {B_ideal}")
 
     # 3. Compute Residual & Condition
     print("Computing residual noise and constructing condition [Acc, Gyro, Vel]...")
@@ -201,9 +258,12 @@ if __name__ == "__main__":
         quat_gt = quat_gt[:limit]
         
         # Residual Noise
+        # 校准
+        mag_cal = (mag - b_hard) @ W_soft.T
+        
         r = R.from_quat(quat_gt)
         B_body_ideal = r.inv().apply(B_ideal)
-        noise = mag - B_body_ideal
+        noise = mag_cal - B_body_ideal
         
         # Condition: Acc(3) + Gyro(3) + Vel(3) = 9 dim
         cond = np.concatenate([acc, gyro, vel_body], axis=1)
@@ -227,6 +287,7 @@ if __name__ == "__main__":
         'noise': X_noise,
         'condition': X_cond,
         'B_ideal': B_ideal,
+        'calibration': {'b_hard': b_hard, 'W_soft': W_soft},
         'stats': {
             'noise_mean': noise_mean, 'noise_std': noise_std,
             'cond_mean': cond_mean, 'cond_std': cond_std

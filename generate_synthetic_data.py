@@ -60,6 +60,18 @@ def generate_synthetic_data(num_variations=5):
         gan_data = pickle.load(f)
         B_ideal_vec = gan_data['B_ideal']
         
+        # [新增] 读取校准参数
+        calib_params = gan_data.get('calibration', None)
+        if calib_params:
+            b_hard = calib_params['b_hard']
+            W_soft = calib_params['W_soft']
+            print(f"Loaded calibration params: b_hard={b_hard}, W_soft diag={np.diag(W_soft)}")
+        else:
+            # 兼容旧数据
+            b_hard = np.zeros(3)
+            W_soft = np.eye(3)
+            print("Warning: No calibration params found, using identity.")
+        
     print(f"B_ideal loaded: {B_ideal_vec}")
     
     # ... (Generator instantiation with c_dim=9 is assumed from previous edits) ...
@@ -114,10 +126,22 @@ def generate_synthetic_data(num_variations=5):
                 syn_noise_norm = syn_noise_norm.squeeze(0)
                 
                 syn_noise = (syn_noise_norm * noise_std + noise_mean).cpu().numpy()
-                mag_aug = B_body_ideal + syn_noise
+                
+                # [修改] 物理场重构
+                # 1. 理想环境场 (World Frame) -> Body Frame
+                r = R.from_quat(quat_gt)
+                B_body_ideal = r.inv().apply(B_ideal_vec) # (T, 3)
+                
+                # 2. 加上 GAN 生成的环境动态噪声
+                mag_clean_body = B_body_ideal + syn_noise
+                
+                # 3. [新增] 加上 AUV 自身的 Hard/Soft Iron (逆校准)
+                # 模拟真实的传感器读数：m_raw = W^-1 * m_clean + b
+                W_inv = np.linalg.inv(W_soft)
+                mag_final_raw = (mag_clean_body @ W_inv.T) + b_hard
                 
                 X_aug = raw_X.copy()
-                X_aug[:, 6:9] = mag_aug
+                X_aug[:, 6:9] = mag_final_raw # 存入的是模拟的 Raw Data
                 
                 aug_X_list.append(X_aug)
                 aug_Y_quat_list.append(quat_gt)

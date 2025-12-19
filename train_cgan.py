@@ -94,7 +94,21 @@ def train_cgan():
     
     # Loss functions
     criterion_adv = nn.BCELoss()
-    criterion_aux = nn.MSELoss() # For condition reconstruction/classification
+    criterion_aux = nn.MSELoss() 
+    
+    # [新增] 物理梯度损失
+    def physics_gradient_loss(noise_seq, vel_seq, limit=0.1):
+        # noise_seq: (B, T, 3)
+        # vel_seq: (B, T, 3) - 从 condition 里取出来，假设 condition 前3位或后3位是速度
+        # 简单的一阶差分
+        diff = noise_seq[:, 1:] - noise_seq[:, :-1] # (B, T-1, 3)
+        dt = 0.1 # 假设 10Hz
+        grad = torch.norm(diff, dim=-1) / dt # (B, T-1)
+        
+        # 物理约束：磁场变化率不应超过某个阈值 (与速度成正比)
+        # 这里简化为惩罚过大的突变 (Smoothness)
+        loss_smooth = torch.mean(grad**2)
+        return loss_smooth
     
     print("Starting training...")
     
@@ -129,6 +143,7 @@ def train_cgan():
             loss_d_fake = criterion_adv(fake_validity, fake_label)
             
             # Total D Loss
+            loss_d_real = loss_d_real + criterion_aux(real_aux, real_cond) # [新增] D也需要学会重构Condition
             loss_d = (loss_d_real + loss_d_fake) / 2
             loss_d.backward()
             opt_D.step()
@@ -142,7 +157,27 @@ def train_cgan():
             
             # Optional: Feature matching or Aux loss (Condition consistency?)
             # Here we just use adversarial loss
-            loss_g = loss_g_adv
+            
+            # 2. [修改] Auxiliary Loss (强制 Condition 一致性)
+            # 假设 condition 的最后3维是 Velocity，前6维是 Acc(3)+Gyro(3)
+            # 判别器预测的 fake_aux 应该接近输入的 real_cond
+            loss_g_aux = criterion_aux(fake_aux, real_cond)
+            
+            # 3. [新增] Physics Loss (Smoothness/Gradient)
+            # 从 condition 中提取速度 (假设 condition 结构: [Acc(3), Gyro(3), Vel(3)])
+            # 注意：condition 已经被归一化了，这里计算 loss 用归一化值即可，主要为了惩罚高频震荡
+            fake_vel = real_cond[:, :, 6:9] 
+            loss_g_phys = physics_gradient_loss(fake_noise, fake_vel)
+            
+            # 4. [新增] Spectral Loss (可选，增强细节)
+            # 比较 real_noise 和 fake_noise 的频域差异
+            real_fft = torch.fft.rfft(real_noise, dim=1)
+            fake_fft = torch.fft.rfft(fake_noise, dim=1)
+            loss_g_freq = nn.MSELoss()(torch.abs(fake_fft), torch.abs(real_fft))
+
+            # 总 Loss
+            # 权重系数需要根据实验调整，建议: adv=1, aux=1, phys=0.1, freq=0.1
+            loss_g = loss_g_adv + 1.0 * loss_g_aux + 0.1 * loss_g_phys + 0.1 * loss_g_freq
             
             loss_g.backward()
             opt_G.step()
